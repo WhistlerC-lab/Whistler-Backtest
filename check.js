@@ -47,17 +47,19 @@ async function getFundingRates(){
 
 async function getOIChangeMap(syms) {
   const map = {};
-  log(`[백그라운드 수집] 24h 미결제약정 데이터 갱신 중... (속도 조절 적용)`);
+  log(`[백그라운드 수집] 멀티-호라이즌 OI(15m→1h·4h) 수집 중...`);
   let done = 0;
   for(const sym of syms) {
     try {
-      const res = await fetch(`${FAPI}/futures/data/openInterestHist?symbol=${sym}&period=1d&limit=2`);
+      const res = await fetch(`${FAPI}/futures/data/openInterestHist?symbol=${sym}&period=15m&limit=24`);
       if(res.ok) {
         const data = await res.json();
-        if(data && data.length >= 2) {
-          const prev = +data[0].sumOpenInterestValue;
-          const cur = +data[data.length-1].sumOpenInterestValue;
-          map[sym] = prev ? (cur - prev) / prev : 0;
+        if(data && data.length >= 5) {
+          const val = data.map(d => +d.sumOpenInterestValue);
+          const cur = val[val.length-1];
+          const p1 = val[Math.max(0, val.length-1-4)];    // 약 1시간 전
+          const p4 = val[Math.max(0, val.length-1-16)];   // 약 4시간 전
+          map[sym] = { short: p1 ? (cur-p1)/p1 : 0, mid: p4 ? (cur-p4)/p4 : 0 };
         }
       }
     } catch(e) {} 
@@ -116,7 +118,7 @@ function renderBtcStatus(br) {
   `;
 }
 
-function calcFeatures(cs, i, btcClose, weights, currentFunding = 0, oiChangePct = 0){
+function calcFeatures(cs, i, btcClose, weights, currentFunding = 0, oiShort = 0, oiMid = 0){
   const need=130; if(i<need) return null;
   const C=cs.slice(i-need+1,i+1);
   const closes=C.map(x=>x.c), highs=C.map(x=>x.h), lows=C.map(x=>x.l), vols=C.map(x=>x.v);
@@ -152,13 +154,16 @@ function calcFeatures(cs, i, btcClose, weights, currentFunding = 0, oiChangePct 
 
   let oiMsg = "", oiStatus = "normal";
 
-  if (oiChangePct !== 0) {
-      if (ret24 > 0.02 && oiChangePct < -0.02) {
+  if (oiShort !== 0 || oiMid !== 0) {
+      // 단기(1h)=타이밍, 중기(4h)=지속성 확인
+      if (ret24 > 0.02 && oiShort < -0.01) {
           breakout *= 0.5; mom *= 0.7; oiMsg = "📉 숏커버링"; oiStatus = "fake";
-      } else if (ret24 > 0.02 && oiChangePct > 0.05) {
-          trend = clamp(trend * 1.2, 0, 1); oiMsg = "🔥 찐상승"; oiStatus = "real";
+      } else if (ret24 > 0.02 && oiShort > 0.015) {
+          trend = clamp(trend * 1.2, 0, 1);
+          if (oiMid > 0.01) { oiMsg = "🔥 찐상승"; oiStatus = "real"; }
+          else { oiMsg = "⚡ 초기유입"; oiStatus = "real"; }   // 단기↑ 중기 미약 = 막 시작
       }
-      if (currentFunding < -0.0005 && oiChangePct > 0.08) {
+      if (currentFunding < -0.0005 && oiShort > 0.025) {
           mom = clamp(mom * 1.5, 0, 1); oiMsg = "🧨 슈퍼 스퀴즈"; oiStatus = "nuke";
       }
       if (cvdRatio > 0.52 && ret24 > 0.02) {
@@ -186,6 +191,7 @@ let CALIB_TABLE = null;
 let BASE_RATE = 0;
 let liveScanResults = []; 
 let sortConfig = { key: 'prob', dir: -1 }; 
+let viewMode = 'card'; // 'card' | 'list'
 
 let autoInterval = null;
 let countdownTimer = null;
@@ -197,6 +203,7 @@ let oiInterval = null;      // OI/펀딩 1분 경량 갱신
 let signalInterval = null;  // 진입신호 판정 (가격흐름) 7초
 let activeSignals = {};     // sym -> {dir, ts} 중복 알림 방지
 let scanEntryPrice = {};    // 스캔 시점 기준가 (가격변화 측정용)
+let ref24Price = {};        // 24시간 전 종가 (변화율 표시용)
 const FAST_OI_MS = 60000;   // 1분
 const SCORE_MS   = 300000;  // 5분
 const SIGNAL_MS  = 7000;    // 7초
@@ -258,7 +265,7 @@ async function performFastUpdate() {
     for(const r of liveScanResults) {
       const full = r.sym + 'USDT';
       if(fundingMap[full] !== undefined) r.funding = fundingMap[full];
-      if(oiMap[full] !== undefined) r.oiPct = oiMap[full];
+      if(oiMap[full] !== undefined) { r.oiShort = oiMap[full].short; r.oiMid = oiMap[full].mid; r.oiPct = oiMap[full].short; }
     }
     renderDashboard();
     log(`🔄 OI/펀딩 경량 갱신 완료 (${liveScanResults.length}종목).`);
@@ -285,22 +292,27 @@ function computeLiveScore(r) {
 function entryVerdict(r) {
   const liveScore = computeLiveScore(r);
   const cvd = r.cvdRatio;
-  const oi = r.oiPct;
+  const oiS = (r.oiShort !== undefined ? r.oiShort : r.oiPct) || 0;  // 단기(1h)
+  const oiM = (r.oiMid !== undefined ? r.oiMid : 0) || 0;            // 중기(4h)
   const fund = r.funding;
   const live = lastPrices[r.sym], base = scanEntryPrice[r.sym];
   const drift = (live && base) ? (live - base) / base : 0;
 
-  // 롱 진입타점: 점수↑ + 매수CVD우위 + 자금유입(OI↑) + 과확장 아님
+  // 롱 진입타점: 점수↑ + 매수CVD우위 + 단기OI 유입 + 과확장 아님 + 가짜 아님
   const longOk = liveScore >= 62 && (r.prob >= 0.5) && cvd >= 0.5 &&
-                 oi > 0.0 && drift < 0.05 && r.oiStatus !== 'fake';
-  // 숏커버 가짜/매도우위 → 회피 신호
-  const shortFlag = (r.oiStatus === 'fake') || (cvd < 0.46 && oi < -0.03);
+                 oiS > 0.0 && drift < 0.05 && r.oiStatus !== 'fake';
+  // 회피: 가짜 or (매도우위+단기이탈) or (단기·중기 동반 이탈)
+  const shortFlag = (r.oiStatus === 'fake') ||
+                    (cvd < 0.46 && oiS < -0.02) ||
+                    (oiS < -0.015 && oiM < -0.02);
 
   let dir = null, reasons = [];
   if (longOk) {
     dir = 'long';
+    if (oiS > 0 && oiM > 0) reasons.push('OI지속유입');   // 단기+중기 동반 = 최상
+    else if (oiS > 0) reasons.push('OI초기유입');         // 단기만 = 막 시작(빠른 포착)
     if (cvd >= 0.55) reasons.push('CVD강매수');
-    if (oi >= 0.05) reasons.push('OI급증');
+    if (oiS >= 0.03) reasons.push('OI급증');
     if (fund < -0.0003) reasons.push('숏스퀴즈');
     if (r.oiStatus === 'nuke') reasons.push('슈퍼스퀴즈');
     if (drift > 0 && drift < 0.015) reasons.push('상승초입');
@@ -308,6 +320,7 @@ function entryVerdict(r) {
     dir = 'short';
     if (r.oiStatus === 'fake') reasons.push('숏커버/가짜');
     if (cvd < 0.46) reasons.push('매도우위');
+    if (oiS < 0 && oiM < 0) reasons.push('자금이탈');
   }
   return { dir, liveScore, reasons };
 }
@@ -412,6 +425,8 @@ function applyTick(symStr, currentPrice, currentVol) {
     lastQuoteVol[symStr] = currentVol;
   }
   lastPrices[symStr] = currentPrice;
+  const chgEl = document.getElementById(`chg-${symStr}`);
+  if (chgEl) { const c = change24(symStr); if (c !== null) { chgEl.style.color = c>=0?'var(--bull)':'var(--bear)'; chgEl.innerText = (c>=0?'+':'')+(c*100).toFixed(2)+'%'; } }
   return true;
 }
 
@@ -574,72 +589,86 @@ async function runEvolution(){
     const btcClose = btcData.map(x=>x.c);
     renderBtcStatus(btcRegime(btcClose, btcClose.length-1));
 
-    const HOR = 36; 
-    log(`[3/3] 🧬 자가 진화 엔진 가동...`);
-    
-    let bestLift = 0;
-    let finalBaseProb = 0;
-    
-    for(let iter=1; iter<=10; iter++){
+    const HOR = 36;
+    const TRAIN_FRAC = 0.7;   // 앞 70% 학습 / 뒤 30% 검증(OOS)
+    log(`[3/3] 🧬 자가 진화 엔진 가동 (워크포워드 70/30 검증)...`);
+
+    let bestTrainLift = 0;
+    let chosen = null;        // {w, trainLift, testLift, testBase, calib}
+    let lastW = null;
+
+    for(let iter=1; iter<=12; iter++){
       let w = { t:Math.random(), m:Math.random(), v:Math.random(), b:Math.random(), r:Math.random() };
       let sum = w.t + w.m + w.v + w.b + w.r;
       w = { t:w.t/sum, m:w.m/sum, v:w.v/sum, b:w.b/sum, r:w.r/sum };
-      
-      const samples=[];
+      lastW = w;
+
+      const train=[], test=[];
       for(const sym of ACTIVE_SYMS){
         if(sym==='BTCUSDT' || !CACHE[sym]) continue;
         const cs = CACHE[sym];
         const n = Math.min(cs.length, btcClose.length);
-        
-        for(let i=130; i<n-HOR; i+=6){ 
-          const f = calcFeatures(cs, i, btcClose, w); 
+        const trainEnd = Math.floor(n * TRAIN_FRAC);
+        for(let i=130; i<n-HOR; i+=6){
+          const f = calcFeatures(cs, i, btcClose, w);
           if(!f) continue;
           const entry = cs[i].c;
           const tpPct = Math.max(0.04, f.atrPct * 2);
           const slPct = Math.max(0.02, f.atrPct * 1);
           const tp = entry * (1 + tpPct);
           const sl = entry * (1 - slPct);
-          
-          let win = 0; 
+          let win = 0;
           for(let j=i+1; j<=i+HOR; j++){
-            if(cs[j].l <= sl) { win = 0; break; } 
-            if(cs[j].h >= tp) { win = 1; break; } 
+            if(cs[j].l <= sl) { win = 0; break; }
+            if(cs[j].h >= tp) { win = 1; break; }
           }
-          samples.push({raw:f.raw, label:win});
+          (i < trainEnd ? train : test).push({ raw:f.raw, label:win });
         }
       }
-      
-      const baseProb = mean(samples.map(s=>s.label));
-      const hiSamples = samples.filter(s=>s.raw>=60);
-      const hiProb = hiSamples.length ? mean(hiSamples.map(s=>s.label)) : 0;
-      
-      const lift = baseProb ? hiProb/baseProb : 0;
-      log(`   └ 세대 ${iter}: 배수(Lift)=${lift.toFixed(2)}x (기저율 ${(baseProb*100).toFixed(1)}% → 고득점 확률 ${(hiProb*100).toFixed(1)}%)`);
-      progFill.style.width=(30 + (iter/10)*70)+'%';
 
-      if(lift > bestLift && hiSamples.length > 30){
-        bestLift = lift;
-        BEST_WEIGHTS = w;
-        finalBaseProb = baseProb;
+      const trBase = mean(train.map(s=>s.label));
+      const trHi = train.filter(s=>s.raw>=60);
+      const trHiProb = trHi.length ? mean(trHi.map(s=>s.label)) : 0;
+      const trainLift = trBase ? trHiProb/trBase : 0;
+
+      const teBase = mean(test.map(s=>s.label));
+      const teHi = test.filter(s=>s.raw>=60);
+      const teHiProb = teHi.length ? mean(teHi.map(s=>s.label)) : 0;
+      const testLift = teBase ? teHiProb/teBase : 0;
+
+      log(`   └ 세대 ${iter}: 학습 ${trainLift.toFixed(2)}x / 검증(OOS) ${testLift.toFixed(2)}x (검증 고득점 ${(teHiProb*100).toFixed(1)}%)`);
+      progFill.style.width=(30 + (iter/12)*70)+'%';
+
+      // 가중치 선택은 학습셋 기준, 단 확률표(CALIB)는 반드시 검증셋으로 산출 → 과최적화 방지
+      if(trainLift > bestTrainLift && trHi.length > 40 && teHi.length > 20){
+        bestTrainLift = trainLift;
         const buckets=[];
-        for(let lo=0;lo<100;lo+=10){
-          const inb=samples.filter(s=>s.raw>=lo&&s.raw<lo+10);
-          if(inb.length>=15) buckets.push({lo, hi:lo+10, prob:mean(inb.map(s=>s.label))});
+        for(let lo=0; lo<100; lo+=10){
+          const inb=test.filter(s=>s.raw>=lo && s.raw<lo+10);
+          if(inb.length>=12) buckets.push({lo, hi:lo+10, prob:mean(inb.map(s=>s.label))});
         }
-        CALIB_TABLE = buckets;
+        chosen = { w, trainLift, testLift, testBase: teBase, calib: buckets };
       }
-      await sleep(10); 
+      await sleep(10);
     }
 
-    BASE_RATE = finalBaseProb;
-
-    if(bestLift < 1.15){
-      warnBox.style.display = 'block';
-      log(`⚠ 진화 실패: 통계적 우위 확보 실패.`);
-      document.getElementById('calibState').textContent = `경고: 변별력 없음`;
+    let bestLift = 0;
+    if(chosen){
+      BEST_WEIGHTS = chosen.w;
+      CALIB_TABLE  = chosen.calib;
+      BASE_RATE    = chosen.testBase;
+      bestLift     = chosen.testLift;   // 정직한 지표 = 검증(OOS) 변별력
     } else {
-      log(`✅ 진화 완료! 최고 효율 파라미터 확보.`);
-      document.getElementById('calibState').textContent = `진화 완료: 변별력 ${bestLift.toFixed(2)}x 우위`;
+      BEST_WEIGHTS = lastW; CALIB_TABLE = null; BASE_RATE = 0;
+    }
+
+    if(!chosen || bestLift < 1.15){
+      warnBox.style.display = 'block';
+      log(`⚠ 진화 실패: 검증(OOS)에서 통계적 우위 확보 실패 — 과최적화 의심, 매매 보류 권장.`);
+      document.getElementById('calibState').textContent = `경고: 검증 변별력 부족`;
+    } else {
+      log(`✅ 진화 완료! 검증(OOS) 변별력 ${bestLift.toFixed(2)}x (학습 ${chosen.trainLift.toFixed(2)}x).`);
+      document.getElementById('calibState').textContent = `진화 완료: 검증 ${bestLift.toFixed(2)}x / 학습 ${chosen.trainLift.toFixed(2)}x`;
       document.getElementById('autoBtn').disabled = false;
     }
     
@@ -685,9 +714,50 @@ function handleSort(val) {
   renderDashboard();
 }
 
+function setView(mode) {
+  viewMode = mode;
+  document.getElementById('viewCardBtn').classList.toggle('on', mode==='card');
+  document.getElementById('viewListBtn').classList.toggle('on', mode==='list');
+  const grid = document.getElementById('scanGrid');
+  grid.className = mode==='card' ? 'grid-board' : 'list-board';
+  renderDashboard();
+}
+
+function fmtPrice(p){
+  if(!p) return "";
+  let dec = p < 0.1 ? 5 : (p < 10 ? 4 : (p > 1000 ? 1 : 2));
+  return "$ " + p.toLocaleString('en-US', {minimumFractionDigits:dec, maximumFractionDigits:dec});
+}
+
+function fmtPct(x){ if(x===undefined||x===null||x===0) return '-'; return (x>0?'+':'')+(x*100).toFixed(2)+'%'; }
+function pctCls(x){ return x>0?'pos':(x<0?'neg':'mut'); }
+function change24(sym){
+  const ref = ref24Price[sym], live = lastPrices[sym];
+  if(!ref || !live) return null;
+  return (live - ref) / ref;
+}
+function chgHtml(sym){
+  const c = change24(sym);
+  if(c === null) return '';
+  const col = c >= 0 ? 'var(--bull)' : 'var(--bear)';
+  return `<span class="chg" id="chg-${sym}" style="color:${col}">${c>=0?'+':''}${(c*100).toFixed(2)}%</span>`;
+}
+
+function applySignalClasses(){
+  for(const r of liveScanResults){
+    const el = document.getElementById(`card-${r.sym}`);
+    if(!el) continue;
+    el.classList.remove('signal-long','signal-short');
+    if(r._sigDir==='long') el.classList.add('signal-long');
+    else if(r._sigDir==='short') el.classList.add('signal-short');
+  }
+}
+
 function renderDashboard() {
   document.getElementById('scanResWrap').style.display = 'block';
   document.getElementById('resCount').innerText = liveScanResults.length;
+  const grid = document.getElementById('scanGrid');
+  grid.className = viewMode==='card' ? 'grid-board' : 'list-board';
 
   liveScanResults.sort((a,b) => {
     let valA = a[sortConfig.key];
@@ -695,31 +765,26 @@ function renderDashboard() {
     if(typeof valA === 'string') return sortConfig.dir * valA.localeCompare(valB);
     return sortConfig.dir * (valA - valB);
   });
-  
+
+  if(viewMode==='list'){ renderListView(); applySignalClasses(); return; }
+
   let h = '';
   for(const r of liveScanResults){
     const probTxt = (r.prob*100).toFixed(1)+'%';
-    const oiTxt = r.oiPct === 0 ? '-' : (r.oiPct > 0 ? '+' : '') + (r.oiPct*100).toFixed(2) + '%';
-    const oiColor = r.oiPct > 0 ? 'pos' : (r.oiPct < 0 ? 'neg' : 'mut');
-    
+    const oiSv = (r.oiShort!==undefined?r.oiShort:r.oiPct);
+    const oiMv = r.oiMid;
+    const evTxt = (r.ev!==undefined) ? ((r.ev>=0?'+':'')+(r.ev*100).toFixed(2)+'%') : '-';
     const cvdPct = (r.cvdRatio*100).toFixed(1);
     const cvdColor = r.cvdRatio >= 0.5 ? 'var(--bull)' : 'var(--bear)';
     const cvdBar = `<div class="bar-wrap"><div class="bar-fill" style="width:${cvdPct}%; background:${cvdColor}"></div></div>`;
-
     let pillHtml = r.oiMsg ? `<span class="pill ${r.oiStatus}" style="font-size:11px; margin-top:6px;">${r.oiMsg}</span>` : '';
-    
-    let displayPrice = "";
-    if (lastPrices[r.sym]) {
-        let currentPrice = lastPrices[r.sym];
-        let dec = currentPrice < 0.1 ? 5 : (currentPrice < 10 ? 4 : (currentPrice > 1000 ? 1 : 2));
-        displayPrice = "$ " + currentPrice.toLocaleString('en-US', {minimumFractionDigits:dec, maximumFractionDigits:dec});
-    }
+    let displayPrice = fmtPrice(lastPrices[r.sym]);
 
     h += `
     <div class="c-card" id="card-${r.sym}">
       <div class="c-hdr">
         <div>
-          <div class="c-sym">${r.sym}</div>
+          <div class="c-sym">${r.sym} ${chgHtml(r.sym)}</div>
           <div class="c-price" id="price-${r.sym}">${displayPrice}</div>
           ${pillHtml}
         </div>
@@ -728,7 +793,6 @@ function renderDashboard() {
           <div class="c-score ${r.raw >= 60 ? 'pos' : ''}">${r.raw}</div>
         </div>
       </div>
-
       <div class="c-row">
         <span class="c-lbl">TP 터치 확률</span> 
         <span class="c-val" style="color:var(--purp); font-size:14px;">${probTxt}</span>
@@ -738,21 +802,59 @@ function renderDashboard() {
         <span class="c-val" style="color:${cvdColor}">${cvdPct}% ${cvdBar}</span>
       </div>
       <div class="c-row">
-        <span class="c-lbl">24h OI 증감</span> 
-        <span class="c-val ${oiColor}">${oiTxt}</span>
+        <span class="c-lbl">OI 1h / 4h</span> 
+        <span class="c-val"><span class="${pctCls(oiSv)}">${fmtPct(oiSv)}</span> <span style="color:var(--tx3)">/</span> <span class="${pctCls(oiMv)}">${fmtPct(oiMv)}</span></span>
+      </div>
+      <div class="c-row">
+        <span class="c-lbl">기대값 (EV)</span> 
+        <span class="c-val" style="color:${r.ev>=0?'var(--bull)':'var(--bear)'}; font-weight:800;">${evTxt}</span>
       </div>
       <div class="c-row">
         <span class="c-lbl">현재 펀딩비</span> 
         <span class="c-val ${r.funding<0?'neg':''}">${(r.funding*100).toFixed(4)}%</span>
       </div>
-
       <div class="c-foot">
         <div class="c-tpsl" style="color:var(--bull)">TP +${(r.tp*100).toFixed(1)}%</div>
         <div class="c-tpsl" style="color:var(--bear)">SL -${(r.sl*100).toFixed(1)}%</div>
       </div>
     </div>`;
   }
-  document.getElementById('scanGrid').innerHTML = h;
+  grid.innerHTML = h;
+  applySignalClasses();
+}
+
+function renderListView(){
+  let rows = '';
+  for(const r of liveScanResults){
+    const probTxt = (r.prob*100).toFixed(1)+'%';
+    const oiSv = (r.oiShort!==undefined?r.oiShort:r.oiPct);
+    const oiMv = r.oiMid;
+    const evTxt = (r.ev!==undefined) ? ((r.ev>=0?'+':'')+(r.ev*100).toFixed(2)+'%') : '-';
+    const cvdPct = (r.cvdRatio*100).toFixed(1);
+    const cvdColor = r.cvdRatio >= 0.5 ? 'var(--bull)' : 'var(--bear)';
+    const pill = r.oiMsg ? `<span class="pill ${r.oiStatus}" style="font-size:10px;">${r.oiMsg}</span>` : '<span style="color:var(--tx3)">-</span>';
+    rows += `<tr class="lrow" id="card-${r.sym}">
+      <td><span class="l-sym">${r.sym}</span> ${chgHtml(r.sym)}</td>
+      <td><span class="l-price" id="price-${r.sym}">${fmtPrice(lastPrices[r.sym])}</span></td>
+      <td style="color:${r.raw>=60?'var(--bull)':'var(--tx)'};font-weight:800;">${r.raw}</td>
+      <td style="color:var(--purp);font-weight:700;">${probTxt}</td>
+      <td style="color:${r.ev>=0?'var(--bull)':'var(--bear)'};font-weight:800;">${evTxt}</td>
+      <td style="color:${cvdColor};font-weight:700;">${cvdPct}%</td>
+      <td class="${pctCls(oiSv)}" style="font-weight:700;">${fmtPct(oiSv)}</td>
+      <td class="${pctCls(oiMv)}" style="font-weight:700;">${fmtPct(oiMv)}</td>
+      <td style="color:${r.funding<0?'var(--bear)':'var(--tx2)'};">${(r.funding*100).toFixed(4)}%</td>
+      <td><span style="color:var(--bull)">+${(r.tp*100).toFixed(1)}%</span> / <span style="color:var(--bear)">-${(r.sl*100).toFixed(1)}%</span></td>
+      <td style="text-align:left;">${pill}</td>
+    </tr>`;
+  }
+  document.getElementById('scanGrid').innerHTML = `
+    <table class="scan-table">
+      <thead><tr>
+        <th>종목</th><th>가격</th><th>진화점수</th><th>성공률</th><th>기대값</th><th>CVD</th>
+        <th>OI 1h</th><th>OI 4h</th><th>펀딩비</th><th>TP / SL</th><th>상태</th>
+      </tr></thead>
+      <tbody>${rows}</tbody>
+    </table>`;
 }
 
 async function runLiveScan(syms){
@@ -766,7 +868,7 @@ async function runLiveScan(syms){
     if(!CACHE[sym]) continue;
     const cs = CACHE[sym];
     const fr = fundingMap[sym] || 0;
-    const oiChange = oiMap[sym] || 0;
+    const oi = oiMap[sym] || {short:0, mid:0};
     
     // 초기화용
     const curClose = cs[cs.length-1].c;
@@ -776,8 +878,9 @@ async function runLiveScan(syms){
         lastQuoteVol[sym.replace('USDT', '')] = curVol;
     }
     scanEntryPrice[sym.replace('USDT','')] = curClose; // 신호 판정용 기준가 갱신
+    { const _k=sym.replace('USDT',''); const _i=cs.length-25; ref24Price[_k] = (_i>=0? cs[_i].c : cs[0].c); }
     
-    const f = calcFeatures(cs, cs.length-1, btcClose, BEST_WEIGHTS, fr, oiChange);
+    const f = calcFeatures(cs, cs.length-1, btcClose, BEST_WEIGHTS, fr, oi.short, oi.mid);
     if(f){
       let prob = 0;
       if(CALIB_TABLE){
@@ -788,13 +891,17 @@ async function runLiveScan(syms){
       const tpPct = Math.max(0.04, f.atrPct * 2);
       const slPct = Math.max(0.02, f.atrPct * 1);
       
+      const ev = prob * tpPct - (1 - prob) * slPct;   // 기대값 (손익비 반영)
       liveScanResults.push({ 
         sym: sym.replace('USDT',''), 
         raw: f.raw, 
         prob: prob, 
+        ev: ev,
         cvdRatio: f.cvdRatio,
         funding: fr, 
-        oiPct: oiChange,
+        oiPct: oi.short,
+        oiShort: oi.short,
+        oiMid: oi.mid,
         oiMsg: f.oiMsg,
         oiStatus: f.oiStatus,
         tp: tpPct, 
@@ -802,7 +909,7 @@ async function runLiveScan(syms){
       });
     }
   }
-  document.getElementById('sortControl').value = 'prob_desc';
-  sortConfig = { key: 'prob', dir: -1 };
+  document.getElementById('sortControl').value = 'ev_desc';
+  sortConfig = { key: 'ev', dir: -1 };
   renderDashboard(); 
 }
