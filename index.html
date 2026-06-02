@@ -48,8 +48,8 @@ input,select{background:var(--bg);border:1px solid var(--bd);color:var(--tx);pad
 /* 대시보드 카드 UI */
 .grid-board { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr)); gap: 16px; margin-top: 12px; }
 /* 목록(테이블) 보기 */
-.list-board { margin-top: 12px; border:1px solid var(--bd); border-radius:8px; overflow:hidden; }
-table.scan-table { width:100%; border-collapse:collapse; font-size:13px; }
+.list-board { margin-top: 12px; border:1px solid var(--bd); border-radius:8px; overflow-x:auto; -webkit-overflow-scrolling:touch; }
+table.scan-table { width:100%; min-width:720px; border-collapse:collapse; font-size:13px; }
 table.scan-table th { background:#0a121d; color:var(--tx3); font-size:11px; text-transform:uppercase; letter-spacing:.05em; text-align:right; padding:9px 12px; border-bottom:1px solid var(--bd); white-space:nowrap; }
 table.scan-table th:first-child, table.scan-table td:first-child { text-align:left; }
 table.scan-table td { padding:9px 12px; border-bottom:1px solid #11202f; text-align:right; font-family:'Consolas',monospace; white-space:nowrap; }
@@ -133,6 +133,33 @@ table.scan-table tbody tr:hover { background:#0d1826; }
 .live-dot { display:inline-block; width:7px; height:7px; border-radius:50%; background:var(--bull); margin-right:5px; animation: livePulse 1.2s infinite; vertical-align:middle; }
 @keyframes livePulse { 0%,100%{opacity:1;} 50%{opacity:0.25;} }
 .delta-up{color:var(--bull);} .delta-down{color:var(--bear);}
+
+.chg { font-size:11px; font-family:'Consolas',monospace; font-weight:700; margin-left:4px; }
+.lrow td:first-child .chg { display:block; margin-left:0; margin-top:2px; }
+
+/* 목록 보기에서 좌우 스크롤 힌트 */
+.list-board::-webkit-scrollbar { height:8px; }
+.list-board::-webkit-scrollbar-thumb { background:#22364d; border-radius:4px; }
+
+/* ===== 모바일 반응형 ===== */
+@media (max-width: 760px) {
+  .wrap { padding: 12px 12px; }
+  header { padding: 10px 12px; }
+  h1 { font-size: 14px; }
+  .row { gap: 10px; }
+  .sort-area { flex-direction: column; align-items: stretch; gap: 10px; }
+  .sort-area > .note { flex-wrap: wrap; gap: 8px 12px; }
+  .sort-area > div:last-child { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; width: 100%; }
+  .view-toggle { margin-right: 0; flex: 1 1 auto; }
+  .view-toggle button { flex: 1 1 0; padding: 9px 0; }
+  #sortControl { flex: 1 1 100%; width: 100%; }
+  .kpi { gap: 12px 18px; }
+  .kpi div b { font-size: 16px; }
+  .grid-board { grid-template-columns: 1fr; gap: 12px; }
+  #toastWrap { max-width: 100%; }
+  .scan-table { font-size: 12px; }
+  table.scan-table th, table.scan-table td { padding: 8px 10px; }
+}
 </style>
 </head>
 <body class="notranslate">
@@ -415,6 +442,7 @@ let oiInterval = null;      // OI/펀딩 1분 경량 갱신
 let signalInterval = null;  // 진입신호 판정 (가격흐름) 7초
 let activeSignals = {};     // sym -> {dir, ts} 중복 알림 방지
 let scanEntryPrice = {};    // 스캔 시점 기준가 (가격변화 측정용)
+let ref24Price = {};        // 24시간 전 종가 (변화율 표시용)
 const FAST_OI_MS = 60000;   // 1분
 const SCORE_MS   = 300000;  // 5분
 const SIGNAL_MS  = 7000;    // 7초
@@ -630,6 +658,8 @@ function applyTick(symStr, currentPrice, currentVol) {
     lastQuoteVol[symStr] = currentVol;
   }
   lastPrices[symStr] = currentPrice;
+  const chgEl = document.getElementById(`chg-${symStr}`);
+  if (chgEl) { const c = change24(symStr); if (c !== null) { chgEl.style.color = c>=0?'var(--bull)':'var(--bear)'; chgEl.innerText = (c>=0?'+':'')+(c*100).toFixed(2)+'%'; } }
   return true;
 }
 
@@ -918,6 +948,18 @@ function fmtPrice(p){
   return "$ " + p.toLocaleString('en-US', {minimumFractionDigits:dec, maximumFractionDigits:dec});
 }
 
+function change24(sym){
+  const ref = ref24Price[sym], live = lastPrices[sym];
+  if(!ref || !live) return null;
+  return (live - ref) / ref;
+}
+function chgHtml(sym){
+  const c = change24(sym);
+  if(c === null) return '';
+  const col = c >= 0 ? 'var(--bull)' : 'var(--bear)';
+  return `<span class="chg" id="chg-${sym}" style="color:${col}">${c>=0?'+':''}${(c*100).toFixed(2)}%</span>`;
+}
+
 function applySignalClasses(){
   for(const r of liveScanResults){
     const el = document.getElementById(`card-${r.sym}`);
@@ -958,7 +1000,7 @@ function renderDashboard() {
     <div class="c-card" id="card-${r.sym}">
       <div class="c-hdr">
         <div>
-          <div class="c-sym">${r.sym}</div>
+          <div class="c-sym">${r.sym} ${chgHtml(r.sym)}</div>
           <div class="c-price" id="price-${r.sym}">${displayPrice}</div>
           ${pillHtml}
         </div>
@@ -1003,7 +1045,7 @@ function renderListView(){
     const cvdColor = r.cvdRatio >= 0.5 ? 'var(--bull)' : 'var(--bear)';
     const pill = r.oiMsg ? `<span class="pill ${r.oiStatus}" style="font-size:10px;">${r.oiMsg}</span>` : '<span style="color:var(--tx3)">-</span>';
     rows += `<tr class="lrow" id="card-${r.sym}">
-      <td><span class="l-sym">${r.sym}</span></td>
+      <td><span class="l-sym">${r.sym}</span> ${chgHtml(r.sym)}</td>
       <td><span class="l-price" id="price-${r.sym}">${fmtPrice(lastPrices[r.sym])}</span></td>
       <td style="color:${r.raw>=60?'var(--bull)':'var(--tx)'};font-weight:800;">${r.raw}</td>
       <td style="color:var(--purp);font-weight:700;">${probTxt}</td>
@@ -1045,6 +1087,7 @@ async function runLiveScan(syms){
         lastQuoteVol[sym.replace('USDT', '')] = curVol;
     }
     scanEntryPrice[sym.replace('USDT','')] = curClose; // 신호 판정용 기준가 갱신
+    { const _k=sym.replace('USDT',''); const _i=cs.length-25; ref24Price[_k] = (_i>=0? cs[_i].c : cs[0].c); }
     
     const f = calcFeatures(cs, cs.length-1, btcClose, BEST_WEIGHTS, fr, oiChange);
     if(f){
