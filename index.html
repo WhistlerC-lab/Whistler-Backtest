@@ -136,6 +136,9 @@ table.scan-table tbody tr:hover{background:#0d1826}
 .c-card.signal-long::before{content:"🎯 진입";position:absolute;top:0;right:0;background:var(--gold);color:#000;font-size:10px;font-weight:900;padding:3px 8px;border-radius:0 8px 0 8px;z-index:5}
 .c-card.signal-short{border-color:var(--bear)!important;box-shadow:0 0 0 1px var(--bear),0 0 18px rgba(255,59,92,.3)}
 .c-card.signal-short::before{content:"⚠ 회피";position:absolute;top:0;right:0;background:var(--bear);color:#fff;font-size:10px;font-weight:900;padding:3px 8px;border-radius:0 8px 0 8px;z-index:5}
+.c-card.signal-squeeze::before{content:"⚡ 스퀴즈 주시";position:absolute;top:0;right:0;background:var(--warn);color:#000;font-size:10px;font-weight:900;padding:3px 8px;border-radius:0 8px 0 8px;z-index:5}
+.lrow.signal-squeeze td:first-child{box-shadow:inset 4px 0 0 var(--warn)}
+.lrow.signal-squeeze .l-sym::after{content:" ⚡"}
 .c-card.signal-watch{border-color:var(--cyan)!important;box-shadow:0 0 0 1px var(--cyan),0 0 14px rgba(52,214,255,.25)}
 .c-card.signal-watch::before{content:"👀 관찰";position:absolute;top:0;right:0;background:var(--cyan);color:#001018;font-size:10px;font-weight:900;padding:3px 8px;border-radius:0 8px 0 8px;z-index:5}
 .lrow.signal-watch td:first-child{box-shadow:inset 4px 0 0 var(--cyan)}
@@ -715,7 +718,17 @@ function entryVerdict(r) {
   const live = lastPrices[r.sym], base = scanEntryPrice[r.sym];
   const drift = (live && base) ? (live - base) / base : 0;
 
-  // 1) 회피 우선 판정
+  // 1) 스퀴즈 주시 선판정 — 숏커버처럼 보이지만 추가 급등 가능성
+  // 조건: 가짜 상승 패턴 + 펀딩비 음수(숏 잔존) + CVD 매수 우위 동시
+  const squeezeWatch = (r.oiStatus === 'fake') &&
+                       (fund < -0.0002) &&
+                       (cvd >= 0.50);
+  if (squeezeWatch) {
+    return { dir: 'squeeze', tier: 'squeeze', score: 0, liveScore,
+             reasons: ['펀딩음수', 'CVD매수', '스퀴즈여력'] };
+  }
+
+  // 2) 회피 판정
   const avoid = (r.oiStatus === 'fake') ||
                 (cvd < 0.46 && oiS < -0.02) ||
                 (oiS < -0.015 && oiM < -0.02);
@@ -763,7 +776,7 @@ function entryVerdict(r) {
 function evaluateSignals() {
   if (!liveScanResults.length) return;
   const now = Date.now();
-  const strong = [], watch = [], shorts = [];
+  const strong = [], watch = [], shorts = [], squeezes = [];
 
   for (const r of liveScanResults) {
     const v = entryVerdict(r);
@@ -773,10 +786,11 @@ function evaluateSignals() {
 
     const card = document.getElementById(`card-${r.sym}`);
     if (card) {
-      card.classList.remove('signal-long', 'signal-short', 'signal-watch');
-      if      (v.tier === 'strong') card.classList.add('signal-long');
-      else if (v.tier === 'watch')  card.classList.add('signal-watch');
-      else if (v.dir  === 'short')  card.classList.add('signal-short');
+      card.classList.remove('signal-long', 'signal-short', 'signal-watch', 'signal-squeeze');
+      if      (v.tier === 'strong')   card.classList.add('signal-long');
+      else if (v.tier === 'watch')    card.classList.add('signal-watch');
+      else if (v.tier === 'squeeze')  card.classList.add('signal-squeeze');
+      else if (v.dir  === 'short')    card.classList.add('signal-short');
     }
 
     if (v.dir === 'long') {
@@ -792,11 +806,14 @@ function evaluateSignals() {
     } else if (v.dir === 'short') {
       shorts.push({ r, v });
       activeSignals[r.sym] = { dir: 'short', ts: now };
+    } else if (v.tier === 'squeeze') {
+      squeezes.push({ r, v });
+      activeSignals[r.sym] = { dir: 'squeeze', ts: now };
     } else {
       delete activeSignals[r.sym];
     }
   }
-  renderSignalPanel(strong, watch, shorts);
+  renderSignalPanel(strong, watch, shorts, squeezes);
 }
 
 // ─────────────────────────────────────────────
@@ -883,7 +900,7 @@ function fireToast(r, v, dir) {
 // ─────────────────────────────────────────────
 // 신호 패널 렌더
 // ─────────────────────────────────────────────
-function renderSignalPanel(strong, watch, shorts) {
+function renderSignalPanel(strong, watch, shorts, squeezes = []) {
   const panel = document.getElementById('signalPanel');
   const list  = document.getElementById('sigList');
   if (!panel || !list) return;
@@ -908,6 +925,16 @@ function renderSignalPanel(strong, watch, shorts) {
     h += `</div>`;
   }
   h += `</div>`;
+
+  if (squeezes.length) {
+    h += `<div class="sig-section">
+      <div class="sig-sec-title" style="color:var(--warn)">⚡ 스퀴즈 주시 — ${squeezes.length}종목 (소량 관찰 가능)</div>
+      <div class="sig-list">`;
+    for (const { r, v } of squeezes) {
+      h += `<span class="sig-chip" style="border-color:var(--warn);color:var(--warn)" onclick="${go(r.sym)}">⚡ <span class="s-sym">${r.sym}</span> ${v.reasons.join(' ')}</span>`;
+    }
+    h += `</div></div>`;
+  }
 
   if (shorts.length) {
     h += `<div class="sig-section">
@@ -1364,10 +1391,11 @@ function applySignalClasses() {
   for (const r of liveScanResults) {
     const el = document.getElementById(`card-${r.sym}`);
     if (!el) continue;
-    el.classList.remove('signal-long', 'signal-short', 'signal-watch');
-    if      (r._sigTier === 'strong') el.classList.add('signal-long');
-    else if (r._sigTier === 'watch')  el.classList.add('signal-watch');
-    else if (r._sigDir  === 'short')  el.classList.add('signal-short');
+    el.classList.remove('signal-long', 'signal-short', 'signal-watch', 'signal-squeeze');
+    if      (r._sigTier === 'strong')   el.classList.add('signal-long');
+    else if (r._sigTier === 'watch')    el.classList.add('signal-watch');
+    else if (r._sigTier === 'squeeze')  el.classList.add('signal-squeeze');
+    else if (r._sigDir  === 'short')    el.classList.add('signal-short');
   }
 }
 
